@@ -16,3 +16,10 @@ kubevirt_vmi_migration_memory_transfer_rate_bytes_per_second{namespace="ns",name
 		t.Fatalf("labels = %+v", got)
 	}
 }
+
+func TestParseRejectsNonFiniteValues(t *testing.T) {
+	got := ParseAll("kubevirt_vmi_migration_data_processed_bytes NaN\nkubevirt_vmi_migration_data_remaining_bytes +Inf\n")
+	if len(got) != 0 {
+		t.Fatalf("non-finite metrics were retained: %#v", got)
+	}
+}

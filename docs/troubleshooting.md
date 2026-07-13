@@ -23,3 +23,11 @@ The drain can continue. Check `pods/proxy` access, the source node's `virt-handl
 ## Interrupted or timed-out drain
 
 The node remains cordoned by default. Inspect `kvdrain status NODE`, active VMIMs, target launcher pods, and hotplug attachment pods. Use `kvdrain uncordon NODE` only after deciding that new scheduling is safe.
+
+## A new workload appears during drain
+
+A cordon stops normal scheduler placement but does not stop clients that set `spec.nodeName` directly. Stop that automation during maintenance. kvdrain requires a quiet interval and performs a final relist, but direct placement can always race any client-side completion check.
+
+## A drain Lease remains after a client crash
+
+kvdrain does not take over an existing Lease based on wall-clock expiry. Verify that no drain process is active, then delete the named Lease from `kube-system` and retry. This fail-closed behavior prevents a skewed client clock from allowing concurrent drains.

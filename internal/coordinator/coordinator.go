@@ -8,6 +8,7 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	virtv1 "kubevirt.io/api/core/v1"
 
@@ -35,6 +36,12 @@ type DrainOptions struct {
 	DeleteEmptyDirData bool
 	GracePeriod        int64
 	AbortUncordons     bool
+}
+
+type trackedVMI struct {
+	Namespace, Name string
+	UID             types.UID
+	HotplugVolumes  map[string]bool
 }
 
 func (c *Coordinator) init() {
@@ -256,21 +263,43 @@ func (c *Coordinator) Drain(parent context.Context, opts DrainOptions) (retErr e
 		return err
 	}
 	started := c.Now()
-	runCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), opts.Timeout)
-	defer cancel()
-	if err := c.Clients.CheckDrainPermissions(runCtx); err != nil {
-		return Operational("drain permissions: %v", err)
+	observeCtx, observeCancel := context.WithTimeout(context.Background(), opts.Timeout)
+	defer observeCancel()
+	mutationCtx, mutationCancel := context.WithCancel(observeCtx)
+	defer mutationCancel()
+	go func() {
+		select {
+		case <-parent.Done():
+			mutationCancel()
+		case <-mutationCtx.Done():
+		}
+	}()
+	if err := c.Clients.CheckDrainPermissions(mutationCtx); err != nil {
+		return drainContextError(parent, observeCtx, "drain permissions", err)
 	}
+	if err := c.Clients.AcquireDrainLease(mutationCtx, c.Node, c.RunID, opts.Timeout); err != nil {
+		return drainContextError(parent, observeCtx, "acquire drain lock", err)
+	}
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := c.Clients.ReleaseDrainLease(releaseCtx, c.Node, c.RunID); err != nil {
+			c.event("run", "warning", "failed to release node drain lease", nil, map[string]any{"reason": err.Error()})
+			if retErr == nil {
+				retErr = Operational("release node drain lease: %v", err)
+			}
+		}
+	}()
 
-	initial, err := c.Clients.Snapshot(runCtx, c.Node)
+	initial, err := c.Clients.Snapshot(mutationCtx, c.Node)
 	if err != nil {
-		return Operational("preflight: %v", err)
+		return drainContextError(parent, observeCtx, "preflight", err)
 	}
 	if err = preflight(initial, opts); err != nil {
 		return err
 	}
-	if err = c.confirmMigrations(runCtx, initial); err != nil {
-		return err
+	if err = c.confirmMigrations(mutationCtx, initial); err != nil {
+		return drainContextError(parent, observeCtx, "preflight", err)
 	}
 	c.event("run", "ready", "preflight checks passed", ref("Node", "", c.Node, string(initial.Node.UID)), map[string]any{
 		"vmiCount": len(initial.VMIs),
@@ -280,27 +309,26 @@ func (c *Coordinator) Drain(parent context.Context, opts DrainOptions) (retErr e
 		return err
 	}
 
-	cutoff := c.Now()
 	initialMigrationUIDs := map[string]bool{}
-	for _, migration := range initial.Migrations {
-		if migration.Active {
-			initialMigrationUIDs[string(migration.Migration.UID)] = true
-		}
+	baselineMigrations, _, err := c.Clients.ListMigrations(mutationCtx)
+	if err != nil {
+		return drainContextError(parent, observeCtx, "baseline migrations", err)
+	}
+	for _, migration := range baselineMigrations {
+		initialMigrationUIDs[string(migration.Migration.UID)] = true
 	}
 	if parent.Err() != nil {
 		return Interrupt("drain interrupted before cordon")
 	}
 	cordonedByUs := !initial.Node.Spec.Unschedulable
 	if cordonedByUs {
-		if err = c.Clients.SetUnschedulable(runCtx, c.Node, true); err != nil {
-			return Operational("cordon: %v", err)
+		if _, err = c.Clients.Cordon(mutationCtx, c.Node, c.RunID); err != nil {
+			return drainContextError(parent, observeCtx, "cordon", err)
 		}
 		if parent.Err() != nil {
-			restoreCtx, restoreCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			restoreErr := c.Clients.SetUnschedulable(restoreCtx, c.Node, false)
-			restoreCancel()
+			restoreErr := c.rollbackCordon(c.RunID, initial.Node.UID)
 			if restoreErr != nil {
-				return Interrupt("drain interrupted during cordon; failed to restore scheduling: %v", restoreErr)
+				return Interrupt("drain interrupted during cordon; node remains cordoned because safe rollback failed: %v", restoreErr)
 			}
 			return Interrupt("drain interrupted during cordon; node scheduling was restored")
 		}
@@ -310,23 +338,21 @@ func (c *Coordinator) Drain(parent context.Context, opts DrainOptions) (retErr e
 		}
 	}
 
-	snapshot, err := c.Clients.Snapshot(runCtx, c.Node)
+	snapshot, err := c.Clients.Snapshot(mutationCtx, c.Node)
 	if err == nil {
 		err = preflight(snapshot, opts)
 	}
 	if err == nil {
-		err = c.confirmMigrations(runCtx, snapshot)
+		err = c.confirmMigrations(mutationCtx, snapshot)
 	}
 	if err != nil {
 		restoreMessage := ""
 		if cordonedByUs {
-			restoreCtx, restoreCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			if restoreErr := c.Clients.SetUnschedulable(restoreCtx, c.Node, false); restoreErr != nil {
-				restoreMessage = fmt.Sprintf("; failed to restore scheduling: %v", restoreErr)
+			if restoreErr := c.rollbackCordon(c.RunID, initial.Node.UID); restoreErr != nil {
+				restoreMessage = fmt.Sprintf("; node remains cordoned because safe rollback failed: %v", restoreErr)
 			}
-			restoreCancel()
 		}
-		return Operational("revalidate after cordon: %v%s", err, restoreMessage)
+		return drainContextError(parent, observeCtx, "revalidate after cordon", fmt.Errorf("%w%s", err, restoreMessage))
 	}
 
 	interrupted := false
@@ -335,9 +361,7 @@ func (c *Coordinator) Drain(parent context.Context, opts DrainOptions) (retErr e
 		if retErr == nil || !interrupted || !settledAbort || !opts.AbortUncordons || !cordonedByUs {
 			return
 		}
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cleanupCancel()
-		if cleanupErr := c.Clients.SetUnschedulable(cleanupCtx, c.Node, false); cleanupErr == nil {
+		if cleanupErr := c.rollbackCordon(c.RunID, initial.Node.UID); cleanupErr == nil {
 			c.event("node", "uncordoned", "interrupted drain settled and node was restored", ref("Node", "", c.Node, string(initial.Node.UID)), nil)
 			if c.emitErr != nil {
 				retErr = fmt.Errorf("%w; node was restored but reporting it failed: %v", retErr, c.emitErr)
@@ -353,8 +377,8 @@ func (c *Coordinator) Drain(parent context.Context, opts DrainOptions) (retErr e
 			break
 		}
 		if normalEligible(pod, opts) {
-			if err = c.evictNormal(runCtx, pod, opts.GracePeriod); err != nil {
-				return err
+			if err = c.evictNormal(mutationCtx, pod, opts.GracePeriod); err != nil {
+				return drainContextError(parent, observeCtx, "evict pod", err)
 			}
 			if err = c.checkOutput(); err != nil {
 				return err
@@ -362,25 +386,24 @@ func (c *Coordinator) Drain(parent context.Context, opts DrainOptions) (retErr e
 		}
 	}
 
-	limit := c.Clients.OutboundMigrationLimit(runCtx)
+	limit := c.Clients.OutboundMigrationLimit(mutationCtx)
 	if opts.ParallelOutbound > 0 && opts.ParallelOutbound < limit {
 		limit = opts.ParallelOutbound
 	}
 	triggered := map[string]bool{}
 	failedSeen := map[string]map[string]bool{}
 	metricsWarned := false
-	initialVMIs := map[string][2]string{}
+	trackedVMIs := map[types.UID]*trackedVMI{}
 	targets := map[string]string{}
 	durations := map[string]float64{}
-	for _, vmi := range snapshot.VMIs {
-		initialVMIs[vmi.VMI.Namespace+"/"+vmi.VMI.Name] = [2]string{vmi.VMI.Namespace, vmi.VMI.Name}
-	}
+	trackVMIs(trackedVMIs, snapshot)
 	for _, migration := range snapshot.Migrations {
 		if migration.Active {
 			triggered[migration.Migration.Namespace+"/"+migration.Migration.Spec.VMIName] = true
 		}
 	}
 
+	emptyObservations := 0
 	for {
 		if err = c.checkOutput(); err != nil {
 			return err
@@ -389,7 +412,7 @@ func (c *Coordinator) Drain(parent context.Context, opts DrainOptions) (retErr e
 			interrupted = true
 			c.event("run", "stopping", "interrupt received, waiting for active migrations", nil, nil)
 		}
-		if runCtx.Err() != nil {
+		if observeCtx.Err() != nil {
 			diagnostics := c.collectDiagnostics(snapshot)
 			if interrupted {
 				return Interrupt("drain interrupted while migrations were still active: %s", diagnostics)
@@ -397,10 +420,11 @@ func (c *Coordinator) Drain(parent context.Context, opts DrainOptions) (retErr e
 			return Timeout("drain timed out: %s", diagnostics)
 		}
 
-		snapshot, err = c.Clients.Snapshot(runCtx, c.Node)
+		snapshot, err = c.Clients.Snapshot(observeCtx, c.Node)
 		if err != nil {
-			return Operational("observe drain: %v", err)
+			return drainContextError(parent, observeCtx, "observe drain", err)
 		}
+		trackVMIs(trackedVMIs, snapshot)
 		if !interrupted {
 			err = preflight(snapshot, opts)
 		}
@@ -408,9 +432,10 @@ func (c *Coordinator) Drain(parent context.Context, opts DrainOptions) (retErr e
 			return Operational("safety recheck: %v; %s", err, c.collectDiagnostics(snapshot))
 		}
 
-		newFailures := observeFailed(failedSeen, snapshot.Migrations, cutoff, initialMigrationUIDs)
+		newFailures := observeFailed(failedSeen, snapshot.Migrations, initialMigrationUIDs)
 		for _, migration := range newFailures {
 			key := migration.Migration.Namespace + "/" + migration.Migration.Spec.VMIName
+			delete(triggered, key)
 			c.emitMigration(migration, len(failedSeen[key]))
 		}
 		for _, migration := range snapshot.Migrations {
@@ -428,7 +453,7 @@ func (c *Coordinator) Drain(parent context.Context, opts DrainOptions) (retErr e
 				return Operational("VMI %s exceeded failed migration retry budget (%d); KubeVirt may continue its evacuation retry; %s", vmiKey, opts.Retries, c.collectDiagnostics(snapshot))
 			}
 		}
-		c.emitTransferMetrics(runCtx, snapshot, &metricsWarned)
+		c.emitTransferMetrics(observeCtx, snapshot, &metricsWarned)
 		if err = c.checkOutput(); err != nil {
 			return err
 		}
@@ -440,8 +465,8 @@ func (c *Coordinator) Drain(parent context.Context, opts DrainOptions) (retErr e
 					break
 				}
 				if normalEligible(pod, opts) {
-					if err = c.evictNormal(runCtx, pod, opts.GracePeriod); err != nil {
-						return err
+					if err = c.evictNormal(mutationCtx, pod, opts.GracePeriod); err != nil {
+						return drainContextError(parent, observeCtx, "evict pod", err)
 					}
 				}
 			}
@@ -456,17 +481,11 @@ func (c *Coordinator) Drain(parent context.Context, opts DrainOptions) (retErr e
 					if outstanding >= limit || triggered[key] || activeByVMI[key] || vmi.Launcher == nil {
 						continue
 					}
-					if err = c.triggerVMI(runCtx, vmi); err != nil {
-						return err
+					if err = c.triggerVMI(mutationCtx, vmi); err != nil {
+						return drainContextError(parent, observeCtx, "trigger migration", err)
 					}
 					triggered[key] = true
 					outstanding++
-				}
-				if !interrupted {
-					err = c.reEvictStaleLaunchers(runCtx, snapshot, triggered)
-				}
-				if err != nil {
-					return err
 				}
 			}
 		}
@@ -479,14 +498,28 @@ func (c *Coordinator) Drain(parent context.Context, opts DrainOptions) (retErr e
 			return Interrupt("drain interrupted with no active migration and %d VMI(s) still on the source; node remains cordoned: %s", len(snapshot.VMIs), diagnosticSummary(snapshot))
 		}
 		if len(snapshot.VMIs) == 0 && active == 0 && !hasEligiblePods(snapshot, opts) {
-			ready, verifyErr := c.verifyHotplug(runCtx, initialVMIs)
+			emptyObservations++
+		} else {
+			emptyObservations = 0
+		}
+		if emptyObservations >= 3 {
+			ready, verifyErr := c.verifyHotplug(observeCtx, trackedVMIs)
 			if verifyErr != nil {
 				return verifyErr
 			}
 			if ready {
+				finalSnapshot, finalErr := c.Clients.Snapshot(observeCtx, c.Node)
+				if finalErr != nil {
+					return drainContextError(parent, observeCtx, "final drain verification", finalErr)
+				}
+				trackVMIs(trackedVMIs, finalSnapshot)
+				if len(finalSnapshot.VMIs) != 0 || countActive(finalSnapshot.Migrations) != 0 || hasEligiblePods(finalSnapshot, opts) {
+					emptyObservations = 0
+					continue
+				}
 				c.event("summary", "succeeded", "node drain completed", ref("Node", "", c.Node, ""), map[string]any{
 					"elapsedSeconds":   c.Now().Sub(started).Seconds(),
-					"vmiCount":         len(initialVMIs),
+					"vmiCount":         len(trackedVMIs),
 					"failedAttempts":   failureCount(failedSeen),
 					"hotplugVerified":  true,
 					"targets":          targets,
@@ -501,12 +534,12 @@ func (c *Coordinator) Drain(parent context.Context, opts DrainOptions) (retErr e
 		}
 		if interrupted {
 			select {
-			case <-runCtx.Done():
+			case <-observeCtx.Done():
 			case <-time.After(c.PollInterval):
 			}
 		} else {
 			select {
-			case <-runCtx.Done():
+			case <-observeCtx.Done():
 			case <-parent.Done():
 				interrupted = true
 			case <-time.After(c.PollInterval):
@@ -602,11 +635,21 @@ func (c *Coordinator) triggerVMI(ctx context.Context, vmi kube.VMIInfo) error {
 		return Operational("confirm migration for %s/%s immediately before eviction: %v", vmi.VMI.Namespace, vmi.VMI.Name, err)
 	}
 	err := c.Clients.EvictPod(ctx, vmi.Launcher, -1, false)
-	if err != nil && !kube.IsKubeVirtEvacuationAccepted(err, vmi.VMI.Namespace, vmi.VMI.Name) {
+	if err = requireKubeVirtInterception(err, vmi.VMI.Namespace, vmi.VMI.Name); err != nil {
 		return Operational("trigger migration for %s/%s: %v", vmi.VMI.Namespace, vmi.VMI.Name, err)
 	}
 	c.event("vmi", "triggered", "KubeVirt evacuation requested", ref("VirtualMachineInstance", vmi.VMI.Namespace, vmi.VMI.Name, string(vmi.VMI.UID)), nil)
 	return c.checkOutput()
+}
+
+func requireKubeVirtInterception(err error, namespace, name string) error {
+	if err == nil {
+		return fmt.Errorf("eviction was accepted for deletion instead of being intercepted by KubeVirt")
+	}
+	if !kube.IsKubeVirtEvacuationAccepted(err, namespace, name) {
+		return err
+	}
+	return nil
 }
 
 func (c *Coordinator) evictNormal(ctx context.Context, pod kube.PodInfo, grace int64) error {
@@ -627,50 +670,26 @@ func (c *Coordinator) evictNormal(ctx context.Context, pod kube.PodInfo, grace i
 	return Operational("evict pod %s/%s: %v", pod.Pod.Namespace, pod.Pod.Name, err)
 }
 
-func (c *Coordinator) reEvictStaleLaunchers(ctx context.Context, snapshot *kube.Snapshot, triggered map[string]bool) error {
-	current := map[string]bool{}
-	for _, vmi := range snapshot.VMIs {
-		if vmi.Launcher != nil {
-			current[vmi.Launcher.Namespace+"/"+vmi.Launcher.Name] = true
-		}
-	}
-	for _, pod := range snapshot.Pods {
-		key := pod.Pod.Namespace + "/" + pod.Pod.Name
-		if !pod.Launcher || current[key] || triggered["stale:"+key] {
-			continue
-		}
-		err := c.Clients.EvictPod(ctx, pod.Pod, -1, false)
-		if err != nil && !apierrors.IsNotFound(err) && !kube.IsRetryablePDB(err) {
-			return Operational("re-evict source launcher %s: %v", key, err)
-		}
-		if kube.IsRetryablePDB(err) {
-			pdbs := kube.BlockingPDBs(pod, false)
-			if len(pdbs) > 0 {
-				c.event("vmi", "blocked", pdbMessage(pdbs), ref("Pod", pod.Pod.Namespace, pod.Pod.Name, string(pod.Pod.UID)), map[string]any{"pdbs": pdbs})
-			}
-			continue
-		}
-		triggered["stale:"+key] = true
-		c.event("pod", "evicting", "source launcher cleanup accepted", ref("Pod", pod.Pod.Namespace, pod.Pod.Name, string(pod.Pod.UID)), nil)
-	}
-	return nil
-}
-
-func (c *Coordinator) verifyHotplug(ctx context.Context, initial map[string][2]string) (bool, error) {
+func (c *Coordinator) verifyHotplug(ctx context.Context, tracked map[types.UID]*trackedVMI) (bool, error) {
 	allReady := true
-	for _, item := range initial {
-		expected, ready, detail, err := c.Clients.HotplugReady(ctx, item[0], item[1], "")
+	for _, item := range tracked {
+		names := make([]string, 0, len(item.HotplugVolumes))
+		for name := range item.HotplugVolumes {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		expected, ready, detail, err := c.Clients.HotplugReady(ctx, item.Namespace, item.Name, item.UID, names, "")
 		if apierrors.IsNotFound(err) {
 			continue
 		}
 		if err != nil {
-			return false, Operational("verify hotplug for %s/%s: %v", item[0], item[1], err)
+			return false, Operational("verify hotplug for %s/%s: %v", item.Namespace, item.Name, err)
 		}
 		if ready < expected {
 			allReady = false
-			c.event("hotplug", "pending", detail, ref("VirtualMachineInstance", item[0], item[1], ""), map[string]any{"expected": expected, "ready": ready})
+			c.event("hotplug", "pending", detail, ref("VirtualMachineInstance", item.Namespace, item.Name, string(item.UID)), map[string]any{"expected": expected, "ready": ready})
 		} else if expected > 0 {
-			c.event("hotplug", "ready", "all hotplug volumes are ready on the target", ref("VirtualMachineInstance", item[0], item[1], ""), map[string]any{"expected": expected, "ready": ready})
+			c.event("hotplug", "ready", "all hotplug volumes are ready on the target", ref("VirtualMachineInstance", item.Namespace, item.Name, string(item.UID)), map[string]any{"expected": expected, "ready": ready})
 		}
 	}
 	return allReady, nil
@@ -687,6 +706,10 @@ func preflight(snapshot *kube.Snapshot, opts DrainOptions) error {
 		if pod.Launcher || pod.Hotplug || pod.Ignored {
 			continue
 		}
+		if pod.UnverifiedLauncher {
+			blockers = append(blockers, fmt.Sprintf("pod %s/%s has unverified KubeVirt launcher metadata", pod.Pod.Namespace, pod.Pod.Name))
+			continue
+		}
 		if !pod.Managed && !opts.Force {
 			blockers = append(blockers, fmt.Sprintf("pod %s/%s is unmanaged (use --force)", pod.Pod.Namespace, pod.Pod.Name))
 		}
@@ -701,7 +724,7 @@ func preflight(snapshot *kube.Snapshot, opts DrainOptions) error {
 }
 
 func normalEligible(pod kube.PodInfo, opts DrainOptions) bool {
-	return !pod.Launcher && !pod.Hotplug && !pod.Ignored && (pod.Managed || opts.Force) && (!pod.EmptyDir || opts.DeleteEmptyDirData)
+	return !pod.Launcher && !pod.UnverifiedLauncher && !pod.Hotplug && !pod.Ignored && (pod.Managed || opts.Force) && (!pod.EmptyDir || opts.DeleteEmptyDirData)
 }
 
 func hasEligiblePods(snapshot *kube.Snapshot, opts DrainOptions) bool {
@@ -743,14 +766,14 @@ func countActive(migrations []kube.MigrationInfo) int {
 	return count
 }
 
-func observeFailed(seen map[string]map[string]bool, migrations []kube.MigrationInfo, cutoff time.Time, initialUIDs map[string]bool) []kube.MigrationInfo {
+func observeFailed(seen map[string]map[string]bool, migrations []kube.MigrationInfo, initialUIDs map[string]bool) []kube.MigrationInfo {
 	var newlyObserved []kube.MigrationInfo
 	for _, migration := range migrations {
 		if !migration.Failed {
 			continue
 		}
 		uid := string(migration.Migration.UID)
-		if initialUIDs[uid] || migration.Migration.CreationTimestamp.Time.Before(cutoff) {
+		if initialUIDs[uid] {
 			continue
 		}
 		key := migration.Migration.Namespace + "/" + migration.Migration.Spec.VMIName
@@ -764,6 +787,38 @@ func observeFailed(seen map[string]map[string]bool, migrations []kube.MigrationI
 		newlyObserved = append(newlyObserved, migration)
 	}
 	return newlyObserved
+}
+
+func trackVMIs(tracked map[types.UID]*trackedVMI, snapshot *kube.Snapshot) {
+	if snapshot == nil {
+		return
+	}
+	for _, info := range snapshot.VMIs {
+		item := tracked[info.VMI.UID]
+		if item == nil {
+			item = &trackedVMI{Namespace: info.VMI.Namespace, Name: info.VMI.Name, UID: info.VMI.UID, HotplugVolumes: map[string]bool{}}
+			tracked[info.VMI.UID] = item
+		}
+		for _, name := range info.HotplugVolumes {
+			item.HotplugVolumes[name] = true
+		}
+	}
+}
+
+func (c *Coordinator) rollbackCordon(runID string, nodeUID types.UID) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return c.Clients.RollbackCordon(ctx, c.Node, runID, nodeUID)
+}
+
+func drainContextError(parent, deadline context.Context, action string, err error) error {
+	if deadline.Err() == context.DeadlineExceeded || err == context.DeadlineExceeded {
+		return Timeout("%s timed out: %v", action, err)
+	}
+	if parent.Err() != nil || err == context.Canceled {
+		return Interrupt("%s interrupted: %v", action, err)
+	}
+	return Operational("%s: %v", action, err)
 }
 
 func failureCount(seen map[string]map[string]bool) int {

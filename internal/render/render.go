@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/stianfro/kvdrain/internal/state"
 	"golang.org/x/term"
@@ -66,7 +67,7 @@ func (r *Renderer) redraw(e state.Event) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if e.Node != "" {
-		r.nodes[e.Node] = true
+		r.nodes[SanitizeHuman(e.Node)] = true
 	}
 	r.update(e)
 
@@ -117,11 +118,11 @@ func (r *Renderer) update(e state.Event) {
 	if e.Object == nil {
 		return
 	}
-	name := strings.TrimPrefix(e.Object.Namespace+"/"+e.Object.Name, "/")
+	name := SanitizeHuman(strings.TrimPrefix(e.Object.Namespace+"/"+e.Object.Name, "/"))
 	vm := e.Object.Kind == "VirtualMachineInstance"
 	if e.Type == "migration" {
 		if vmi, ok := e.Details["vmi"].(string); ok && vmi != "" {
-			name = strings.TrimPrefix(e.Object.Namespace+"/"+vmi, "/")
+			name = SanitizeHuman(strings.TrimPrefix(e.Object.Namespace+"/"+vmi, "/"))
 		}
 		vm = true
 	}
@@ -130,8 +131,8 @@ func (r *Renderer) update(e state.Event) {
 		key = "pod:" + name
 	}
 	row := r.rows[key]
-	row.name, row.vm, row.node = name, vm, e.Node
-	row.message = e.Message
+	row.name, row.vm, row.node = name, vm, SanitizeHuman(e.Node)
+	row.message = SanitizeHuman(e.Message)
 	switch e.Type {
 	case "migration":
 		row.phase = title(e.State)
@@ -174,12 +175,12 @@ func (r *Renderer) nodeName() string {
 func formatLine(e state.Event, wide bool) string {
 	object := ""
 	if e.Object != nil {
-		object = strings.TrimPrefix(e.Object.Namespace+"/"+e.Object.Name, "/")
+		object = SanitizeHuman(strings.TrimPrefix(e.Object.Namespace+"/"+e.Object.Name, "/"))
 	}
-	line := fmt.Sprintf("%-12s %-18s %-32s %s", e.State, e.Type, object, e.Message)
+	line := fmt.Sprintf("%-12s %-18s %-32s %s", SanitizeHuman(e.State), SanitizeHuman(e.Type), object, SanitizeHuman(e.Message))
 	if wide && len(e.Details) > 0 {
 		details, _ := json.Marshal(e.Details)
-		line += " " + string(details)
+		line += " " + SanitizeHuman(string(details))
 	}
 	return strings.TrimRight(line, " ")
 }
@@ -236,7 +237,30 @@ func numberString(value any) string { return fmt.Sprintf("%d", int64(number(valu
 
 func stringDetail(details map[string]any, key string) string {
 	value, _ := details[key].(string)
-	return value
+	return SanitizeHuman(value)
+}
+
+// SanitizeHuman prevents cluster-controlled strings from injecting terminal
+// control sequences or forging additional plain-text log lines. JSON output is
+// intentionally left unchanged and is protected by JSON encoding.
+func SanitizeHuman(value string) string {
+	var out strings.Builder
+	for _, r := range value {
+		switch r {
+		case '\n':
+			out.WriteString(`\n`)
+		case '\r':
+			out.WriteString(`\r`)
+		case '\t':
+			out.WriteByte(' ')
+		default:
+			if r < 0x20 || (r >= 0x7f && r <= 0x9f) || unicode.Is(unicode.Cf, r) {
+				continue
+			}
+			out.WriteRune(r)
+		}
+	}
+	return out.String()
 }
 
 func title(value string) string {

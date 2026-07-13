@@ -10,7 +10,7 @@ import (
 )
 
 type permission struct {
-	group, resource, subresource, verb string
+	group, resource, subresource, verb, namespace string
 }
 
 var readPermissions = []permission{
@@ -37,6 +37,9 @@ func (c Clients) CheckDrainPermissions(ctx context.Context) error {
 		permission{resource: "nodes", verb: "patch"},
 		permission{resource: "pods", subresource: "eviction", verb: "create"},
 		permission{resource: "events", verb: "list"},
+		permission{group: "coordination.k8s.io", resource: "leases", verb: "get", namespace: LeaseNamespace},
+		permission{group: "coordination.k8s.io", resource: "leases", verb: "create", namespace: LeaseNamespace},
+		permission{group: "coordination.k8s.io", resource: "leases", verb: "delete", namespace: LeaseNamespace},
 	)
 	return c.checkPermissions(ctx, permissions)
 }
@@ -57,7 +60,7 @@ func (c Clients) checkPermissions(ctx context.Context, permissions []permission)
 	for _, item := range permissions {
 		review, err := c.Core.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, &authorizationv1.SelfSubjectAccessReview{
 			Spec: authorizationv1.SelfSubjectAccessReviewSpec{ResourceAttributes: &authorizationv1.ResourceAttributes{
-				Group: item.group, Resource: item.resource, Subresource: item.subresource, Verb: item.verb,
+				Group: item.group, Resource: item.resource, Subresource: item.subresource, Verb: item.verb, Namespace: item.namespace,
 			}}}, metav1.CreateOptions{})
 		if err != nil {
 			return fmt.Errorf("check %s permission for %s: %w", item.verb, item.resource, err)

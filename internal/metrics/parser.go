@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"bufio"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -50,7 +51,7 @@ func ParseAll(input string) map[string]Transfer {
 			}
 		}
 		v, err := strconv.ParseFloat(fields[1], 64)
-		if err != nil {
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
 			continue
 		}
 		namespace := metricLabel(labels, "namespace")

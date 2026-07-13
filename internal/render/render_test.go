@@ -47,3 +47,11 @@ func TestLiveRowCombinesMigrationTransferAndHotplug(t *testing.T) {
 		t.Fatalf("transfer = %q", row.transfer)
 	}
 }
+
+func TestHumanOutputStripsTerminalControlsAndEscapesLines(t *testing.T) {
+	message := "before\x1b]52;c;clipboard\a\nafter\u009b31m\u202ereversed"
+	got := formatLine(state.Event{Type: "pod", State: "blocked", Message: message}, false)
+	if strings.ContainsAny(got, "\x1b\a\u009b\u202e") || !strings.Contains(got, `\nafter`) || strings.Count(got, "\n") != 0 {
+		t.Fatalf("unsafe human output: %q", got)
+	}
+}

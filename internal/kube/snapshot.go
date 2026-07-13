@@ -10,6 +10,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	virtv1 "kubevirt.io/api/core/v1"
@@ -38,7 +39,9 @@ type VMIInfo struct {
 	EligibleTargets  []string
 	HotplugExpected  int
 	HotplugReady     int
+	HotplugVolumes   []string
 	Launcher         *corev1.Pod
+	LauncherPDBs     []PDBInfo
 	Blocker          string
 }
 
@@ -55,12 +58,15 @@ type MigrationInfo struct {
 type PodInfo struct {
 	Pod      *corev1.Pod
 	Launcher bool
-	Hotplug  bool
-	Ignored  bool
-	Managed  bool
-	EmptyDir bool
-	Blocker  string
-	PDBs     []PDBInfo
+	// UnverifiedLauncher marks launcher-like metadata that could not be bound
+	// to the VMI controller's ActivePods status.
+	UnverifiedLauncher bool
+	Hotplug            bool
+	Ignored            bool
+	Managed            bool
+	EmptyDir           bool
+	Blocker            string
+	PDBs               []PDBInfo
 }
 
 type PDBInfo struct {
@@ -106,9 +112,11 @@ func (c Clients) Snapshot(ctx context.Context, nodeName string) (*Snapshot, erro
 	}
 
 	s := &Snapshot{Node: node, Nodes: nodes.Items}
+	vmiByUID := map[types.UID]*virtv1.VirtualMachineInstance{}
 	hotplugUIDs := map[types.UID]bool{}
 	hotplugNames := map[string]bool{}
 	for i := range vmis.Items {
+		vmiByUID[vmis.Items[i].UID] = &vmis.Items[i]
 		for _, volume := range vmis.Items[i].Status.VolumeStatus {
 			if volume.HotplugVolume != nil {
 				hotplugUIDs[volume.HotplugVolume.AttachPodUID] = true
@@ -124,8 +132,8 @@ func (c Clients) Snapshot(ctx context.Context, nodeName string) (*Snapshot, erro
 		if p.Spec.NodeName != nodeName {
 			continue
 		}
-		info := classifyPod(p, hotplugUIDs, hotplugNames)
-		info.PDBs = matchingPDBs(p, pdbs.Items)
+		info := classifyPod(p, hotplugUIDs, hotplugNames, vmiByUID)
+		info.PDBs = matchingPDBs(p, pdbs.Items, vmiByUID)
 		s.Pods = append(s.Pods, info)
 	}
 	for i := range vmis.Items {
@@ -140,8 +148,15 @@ func (c Clients) Snapshot(ctx context.Context, nodeName string) (*Snapshot, erro
 			info.EvictionStrategy = c.vmEvictionStrategy(ctx, vmi)
 		}
 		info.Launcher = launcherFor(vmi, pods.Items)
+		if info.Launcher != nil {
+			info.LauncherPDBs = matchingPDBs(info.Launcher, pdbs.Items, vmiByUID)
+		}
 		info.EligibleTargets = eligibleTargets(vmi, info.Launcher, nodes.Items, pvcs.Items, pvs.Items, nodeName)
-		info.HotplugExpected, info.HotplugReady = hotplugState(vmi, pods.Items, "")
+		info.HotplugVolumes, err = c.expectedHotplugVolumeNames(ctx, vmi)
+		if err != nil {
+			return nil, fmt.Errorf("derive hotplug volumes for VMI %s/%s: %w", vmi.Namespace, vmi.Name, err)
+		}
+		info.HotplugExpected, info.HotplugReady = hotplugStateForNames(vmi, pods.Items, "", info.HotplugVolumes)
 		if !info.Migratable {
 			info.Blocker = "VMI is not LiveMigratable: " + info.MigratableReason
 		} else if info.EvictionStrategy != string(virtv1.EvictionStrategyLiveMigrate) && info.EvictionStrategy != string(virtv1.EvictionStrategyLiveMigrateIfPossible) {
@@ -191,26 +206,29 @@ func (c Clients) Snapshot(ctx context.Context, nodeName string) (*Snapshot, erro
 	return s, nil
 }
 
-func ClassifyPod(p *corev1.Pod) PodInfo { return classifyPod(p, nil, nil) }
-func classifyPod(p *corev1.Pod, hotplugUIDs map[types.UID]bool, hotplugNames map[string]bool) PodInfo {
+func ClassifyPod(p *corev1.Pod) PodInfo { return classifyPod(p, nil, nil, nil) }
+func classifyPod(p *corev1.Pod, hotplugUIDs map[types.UID]bool, hotplugNames map[string]bool, vmis map[types.UID]*virtv1.VirtualMachineInstance) PodInfo {
 	out := PodInfo{Pod: p}
-	out.Launcher = strings.HasPrefix(p.GenerateName, "virt-launcher-") || p.Labels[virtv1.AppLabel] == "virt-launcher" || p.Annotations[virtv1.DomainAnnotation] != ""
+	out.Launcher = verifiedLauncherVMI(p, vmis) != nil
 	out.Hotplug = hotplugUIDs[p.UID] || hotplugNames[p.Name]
 	if out.Launcher || out.Hotplug {
 		return out
 	}
+	out.UnverifiedLauncher = looksLikeLauncher(p)
 	if p.Annotations[corev1.MirrorPodAnnotationKey] != "" || p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed || controlledByKind(p, "DaemonSet") {
 		out.Ignored = true
 		return out
 	}
-	out.Managed = hasController(p)
+	out.Managed = hasController(p) && !out.UnverifiedLauncher
 	for _, v := range p.Spec.Volumes {
 		if v.EmptyDir != nil {
 			out.EmptyDir = true
 			break
 		}
 	}
-	if !out.Managed {
+	if out.UnverifiedLauncher {
+		out.Blocker = "launcher-like pod is not present in verified VMI ActivePods status"
+	} else if !out.Managed {
 		out.Blocker = "unmanaged pod"
 	} else if out.EmptyDir {
 		out.Blocker = "pod uses emptyDir"
@@ -342,7 +360,7 @@ func toleratesNode(node *corev1.Node, tolerations []corev1.Toleration) bool {
 	return true
 }
 
-func matchingPDBs(pod *corev1.Pod, pdbs []policyv1.PodDisruptionBudget) []PDBInfo {
+func matchingPDBs(pod *corev1.Pod, pdbs []policyv1.PodDisruptionBudget, vmis map[types.UID]*virtv1.VirtualMachineInstance) []PDBInfo {
 	var out []PDBInfo
 	for i := range pdbs {
 		pdb := &pdbs[i]
@@ -353,13 +371,8 @@ func matchingPDBs(pod *corev1.Pod, pdbs []policyv1.PodDisruptionBudget) []PDBInf
 		if err != nil || !selector.Matches(labels.Set(pod.Labels)) {
 			continue
 		}
-		owned := false
-		for _, owner := range pdb.OwnerReferences {
-			if owner.Kind == "VirtualMachineInstance" && (pod.Labels[virtv1.CreatedByLabel] == "" || string(owner.UID) == pod.Labels[virtv1.CreatedByLabel]) {
-				owned = true
-				break
-			}
-		}
+		vmi := verifiedLauncherVMI(pod, vmis)
+		owned := vmi != nil && controlledByKubeVirtVMI(pdb.OwnerReferences, vmi)
 		out = append(out, PDBInfo{Name: pdb.Name, DisruptionsAllowed: pdb.Status.DisruptionsAllowed, CurrentHealthy: pdb.Status.CurrentHealthy, DesiredHealthy: pdb.Status.DesiredHealthy, KubeVirtOwned: owned})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -435,23 +448,116 @@ func nodeReady(n *corev1.Node) bool {
 func launcherFor(vmi *virtv1.VirtualMachineInstance, pods []corev1.Pod) *corev1.Pod {
 	for i := range pods {
 		p := &pods[i]
-		if p.Namespace == vmi.Namespace && p.Spec.NodeName == vmi.Status.NodeName && p.Labels[virtv1.CreatedByLabel] == string(vmi.UID) {
-			return p
-		}
-	}
-	for i := range pods {
-		p := &pods[i]
-		if p.Namespace == vmi.Namespace && p.Spec.NodeName == vmi.Status.NodeName && p.Annotations[virtv1.DomainAnnotation] == vmi.Name {
+		if p.Spec.NodeName == vmi.Status.NodeName && launcherOwnedByVMI(p, vmi) {
 			return p
 		}
 	}
 	return nil
 }
+
+func verifiedLauncherVMI(pod *corev1.Pod, vmis map[types.UID]*virtv1.VirtualMachineInstance) *virtv1.VirtualMachineInstance {
+	if len(vmis) == 0 {
+		return nil
+	}
+	createdBy := types.UID(pod.Labels[virtv1.CreatedByLabel])
+	if createdBy == "" {
+		return nil
+	}
+	vmi := vmis[createdBy]
+	if vmi == nil || !launcherOwnedByVMI(pod, vmi) {
+		return nil
+	}
+	return vmi
+}
+
+func launcherOwnedByVMI(pod *corev1.Pod, vmi *virtv1.VirtualMachineInstance) bool {
+	activeNode, active := vmi.Status.ActivePods[pod.UID]
+	return active && activeNode == pod.Spec.NodeName && pod.Namespace == vmi.Namespace && pod.Labels[virtv1.CreatedByLabel] == string(vmi.UID) && controlledByKubeVirtVMI(pod.OwnerReferences, vmi)
+}
+
+func looksLikeLauncher(pod *corev1.Pod) bool {
+	if strings.HasPrefix(pod.GenerateName, "virt-launcher-") || pod.Labels[virtv1.AppLabel] == "virt-launcher" || pod.Labels[virtv1.CreatedByLabel] != "" || pod.Annotations[virtv1.DomainAnnotation] != "" {
+		return true
+	}
+	for _, owner := range pod.OwnerReferences {
+		gv, err := schema.ParseGroupVersion(owner.APIVersion)
+		if err == nil && gv.Group == "kubevirt.io" && owner.Kind == "VirtualMachineInstance" {
+			return true
+		}
+	}
+	return false
+}
+
+func controlledByKubeVirtVMI(owners []metav1.OwnerReference, vmi *virtv1.VirtualMachineInstance) bool {
+	for _, owner := range owners {
+		group := ""
+		if gv, err := schema.ParseGroupVersion(owner.APIVersion); err == nil {
+			group = gv.Group
+		}
+		if owner.Controller != nil && *owner.Controller && group == "kubevirt.io" && owner.Kind == "VirtualMachineInstance" && owner.Name == vmi.Name && owner.UID == vmi.UID {
+			return true
+		}
+	}
+	return false
+}
+
+func hotplugVolumeNamesFromStatus(vmi *virtv1.VirtualMachineInstance) []string {
+	names := map[string]bool{}
+	for _, status := range vmi.Status.VolumeStatus {
+		if status.HotplugVolume != nil {
+			names[status.Name] = true
+		}
+	}
+	return sortedKeys(names)
+}
+
+func (c Clients) expectedHotplugVolumeNames(ctx context.Context, vmi *virtv1.VirtualMachineInstance) ([]string, error) {
+	names := map[string]bool{}
+	for _, name := range hotplugVolumeNamesFromStatus(vmi) {
+		names[name] = true
+	}
+	for _, owner := range vmi.OwnerReferences {
+		gv, err := schema.ParseGroupVersion(owner.APIVersion)
+		if err != nil || gv.Group != "kubevirt.io" || owner.Kind != "VirtualMachine" || owner.UID == "" || owner.Controller == nil || !*owner.Controller {
+			continue
+		}
+		vm, err := c.Virt.VirtualMachine(vmi.Namespace).Get(ctx, owner.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		if vm.UID != owner.UID || vm.Spec.Template == nil {
+			return nil, fmt.Errorf("owning VirtualMachine identity or template changed")
+		}
+		templateVolumes := map[string]bool{}
+		for _, volume := range vm.Spec.Template.Spec.Volumes {
+			templateVolumes[volume.Name] = true
+		}
+		for _, volume := range vmi.Spec.Volumes {
+			if !templateVolumes[volume.Name] {
+				names[volume.Name] = true
+			}
+		}
+	}
+	return sortedKeys(names), nil
+}
+
+func sortedKeys(values map[string]bool) []string {
+	out := make([]string, 0, len(values))
+	for value := range values {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
 func hotplugState(vmi *virtv1.VirtualMachineInstance, pods []corev1.Pod, target string) (int, int) {
+	return hotplugStateForNames(vmi, pods, target, hotplugVolumeNamesFromStatus(vmi))
+}
+
+func hotplugStateForNames(vmi *virtv1.VirtualMachineInstance, pods []corev1.Pod, target string, expectedNames []string) (int, int) {
 	if target == "" {
 		target = vmi.Status.NodeName
 	}
-	expected, ready := 0, 0
+	expected, ready := len(expectedNames), 0
 	podsByUID := map[types.UID]*corev1.Pod{}
 	podsByName := map[string]*corev1.Pod{}
 	for i := range pods {
@@ -459,11 +565,19 @@ func hotplugState(vmi *virtv1.VirtualMachineInstance, pods []corev1.Pod, target 
 		podsByUID[p.UID] = p
 		podsByName[p.Name] = p
 	}
+	specVolumes := map[string]bool{}
+	for _, volume := range vmi.Spec.Volumes {
+		specVolumes[volume.Name] = true
+	}
+	statusByName := map[string]virtv1.VolumeStatus{}
 	for _, volume := range vmi.Status.VolumeStatus {
-		if volume.HotplugVolume == nil {
+		statusByName[volume.Name] = volume
+	}
+	for _, name := range expectedNames {
+		volume, found := statusByName[name]
+		if !found || !specVolumes[name] || volume.HotplugVolume == nil {
 			continue
 		}
-		expected++
 		if volume.Phase != virtv1.VolumeReady {
 			continue
 		}

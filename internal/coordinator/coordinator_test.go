@@ -6,6 +6,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	virtv1 "kubevirt.io/api/core/v1"
@@ -21,12 +22,12 @@ func TestObserveFailedCountsRelevantUIDOnce(t *testing.T) {
 	}
 	items := []kube.MigrationInfo{migration("old", cutoff.Add(-time.Second)), migration("new", cutoff.Add(time.Second)), migration("initial", cutoff.Add(-time.Second))}
 	seen := map[string]map[string]bool{}
-	initial := map[string]bool{"initial": true}
-	got := observeFailed(seen, items, cutoff, initial)
+	initial := map[string]bool{"old": true, "initial": true}
+	got := observeFailed(seen, items, initial)
 	if len(got) != 1 || len(seen["ns/vm"]) != 1 {
 		t.Fatalf("new failures=%d seen=%v", len(got), seen)
 	}
-	if got := observeFailed(seen, items, cutoff, initial); len(got) != 0 {
+	if got := observeFailed(seen, items, initial); len(got) != 0 {
 		t.Fatalf("duplicate failures counted: %d", len(got))
 	}
 }
@@ -36,6 +37,14 @@ func TestPreflightRejectsNewUnsafePod(t *testing.T) {
 	snapshot := &kube.Snapshot{Pods: []kube.PodInfo{{Pod: pod, EmptyDir: true}}}
 	if err := preflight(snapshot, DrainOptions{}); err == nil {
 		t.Fatal("unsafe late pod passed preflight")
+	}
+}
+
+func TestPreflightForceCannotBypassUnverifiedLauncher(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "lookalike"}}
+	snapshot := &kube.Snapshot{Pods: []kube.PodInfo{{Pod: pod, UnverifiedLauncher: true}}}
+	if err := preflight(snapshot, DrainOptions{Force: true, DeleteEmptyDirData: true}); err == nil {
+		t.Fatal("force bypassed unverified launcher protection")
 	}
 }
 
@@ -56,5 +65,15 @@ func TestMigrationDuration(t *testing.T) {
 	got, ok := migrationDuration(migration)
 	if !ok || got != 32*time.Second {
 		t.Fatalf("duration = %s, %t", got, ok)
+	}
+}
+
+func TestRealLauncherEvictionMustBeIntercepted(t *testing.T) {
+	if err := requireKubeVirtInterception(nil, "ns", "vm"); err == nil {
+		t.Fatal("HTTP 200 launcher eviction was accepted")
+	}
+	expected := apierrors.NewTooManyRequests(`Eviction triggered evacuation of VMI "ns/vm"`, 0)
+	if err := requireKubeVirtInterception(expected, "ns", "vm"); err != nil {
+		t.Fatalf("expected KubeVirt interception was rejected: %v", err)
 	}
 }

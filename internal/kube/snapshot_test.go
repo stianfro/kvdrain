@@ -22,7 +22,8 @@ func TestClassifyPod(t *testing.T) {
 		{name: "managed emptydir", pod: corev1.Pod{ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{Kind: "ReplicaSet", Controller: &controller}}}, Spec: corev1.PodSpec{Volumes: []corev1.Volume{{VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}}}}, managed: true, empty: true},
 		{name: "custom controller", pod: corev1.Pod{ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{Kind: "CustomController", Controller: &controller}}}}, managed: true},
 		{name: "non-controller owner is unmanaged", pod: corev1.Pod{ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{Kind: "CustomOwner"}}}}},
-		{name: "launcher annotation", pod: corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{virtv1.DomainAnnotation: "vm"}}}, launcher: true},
+		{name: "spoofed launcher annotation", pod: corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{virtv1.DomainAnnotation: "vm"}}}},
+		{name: "spoofed launcher generate name", pod: corev1.Pod{ObjectMeta: metav1.ObjectMeta{GenerateName: "virt-launcher-fake-"}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -36,11 +37,32 @@ func TestClassifyPod(t *testing.T) {
 
 func TestHotplugUsesExactAttachmentIdentity(t *testing.T) {
 	uid := types.UID("attach-1")
-	vmi := &virtv1.VirtualMachineInstance{Status: virtv1.VirtualMachineInstanceStatus{NodeName: "target", VolumeStatus: []virtv1.VolumeStatus{{Phase: virtv1.VolumeReady, HotplugVolume: &virtv1.HotplugVolumeStatus{AttachPodUID: uid, AttachPodName: "attachment"}}}}}
+	vmi := &virtv1.VirtualMachineInstance{Spec: virtv1.VirtualMachineInstanceSpec{Volumes: []virtv1.Volume{{Name: "hot"}}}, Status: virtv1.VirtualMachineInstanceStatus{NodeName: "target", VolumeStatus: []virtv1.VolumeStatus{{Name: "hot", Phase: virtv1.VolumeReady, HotplugVolume: &virtv1.HotplugVolumeStatus{AttachPodUID: uid, AttachPodName: "attachment"}}}}}
 	pods := []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: "attachment-like", UID: "other"}, Spec: corev1.PodSpec{NodeName: "target"}, Status: corev1.PodStatus{Phase: corev1.PodRunning}}, {ObjectMeta: metav1.ObjectMeta{Name: "attachment", UID: uid}, Spec: corev1.PodSpec{NodeName: "target"}, Status: corev1.PodStatus{Phase: corev1.PodRunning}}}
 	expected, ready := hotplugState(vmi, pods, "target")
 	if expected != 1 || ready != 1 {
 		t.Fatalf("expected %d ready %d", expected, ready)
+	}
+}
+
+func TestLauncherRequiresExactKubeVirtControllerAndVMIUID(t *testing.T) {
+	controller := true
+	vmi := &virtv1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Name: "vm", Namespace: "ns", UID: "vmi-1"}, Status: virtv1.VirtualMachineInstanceStatus{ActivePods: map[types.UID]string{"pod-1": "source"}}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "virt-launcher-vm", Namespace: "ns", UID: "pod-1", Labels: map[string]string{virtv1.CreatedByLabel: "vmi-1"}, OwnerReferences: []metav1.OwnerReference{{APIVersion: "kubevirt.io/v1", Kind: "VirtualMachineInstance", Name: "vm", UID: "vmi-1", Controller: &controller}}}, Spec: corev1.PodSpec{NodeName: "source"}}
+	got := classifyPod(pod, nil, nil, map[types.UID]*virtv1.VirtualMachineInstance{"vmi-1": vmi})
+	if !got.Launcher {
+		t.Fatal("verified launcher was treated as a normal pod")
+	}
+	pod.OwnerReferences[0].UID = "attacker"
+	got = classifyPod(pod, nil, nil, map[types.UID]*virtv1.VirtualMachineInstance{"vmi-1": vmi})
+	if got.Launcher {
+		t.Fatal("launcher with mismatched owner UID was trusted")
+	}
+	if got.Managed {
+		t.Fatal("unverified launcher lookalike was treated as controller-managed")
+	}
+	if !got.UnverifiedLauncher {
+		t.Fatal("unverified launcher lookalike was not marked as a hard blocker")
 	}
 }
 

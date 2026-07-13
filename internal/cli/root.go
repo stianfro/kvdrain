@@ -45,7 +45,7 @@ func Execute() int {
 	go func() { <-sig; cancel(); <-sig; os.Exit(130) }()
 	cmd := NewRootCommand(os.Stdout, os.Stderr)
 	if err := cmd.ExecuteContext(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, render.SanitizeHuman(err.Error()))
 		return coordinator.ExitCode(err)
 	}
 	return 0

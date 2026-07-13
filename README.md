@@ -14,7 +14,7 @@ No controller, CRD, or in-cluster component is installed. The CLI uses the selec
 - Kubernetes `policy/v1` eviction for normal pods with collapsed PDB status.
 - Typed VMIM observation with target, phase, retry history, transfer metrics when available, and hotplug verification.
 - TTY table, append-only `--no-tty` output, and versioned NDJSON events.
-- Cordon and uncordon through server-side apply with field manager `kvdrain`.
+- Per-node drain serialization with a Kubernetes Lease, run-owned cordons, and conditional rollback.
 
 Capacity simulation, scheduler dry-run, and metrics export are not part of the current release.
 
@@ -26,7 +26,19 @@ Transfer metrics are optional. kvdrain attempts to read the source node's `virt-
 
 ## Install
 
-Download an archive from [GitHub Releases](https://github.com/stianfro/kvdrain/releases), verify `checksums.txt`, then place `kvdrain` on your `PATH`.
+Download an archive, `checksums.txt`, and `checksums.txt.sigstore.json` from [GitHub Releases](https://github.com/stianfro/kvdrain/releases). Verify the GitHub Actions signing identity before trusting the checksums:
+
+```sh
+cosign verify-blob \
+  --bundle checksums.txt.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/stianfro/kvdrain/\.github/workflows/release\.yml@refs/tags/v[0-9].*$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  checksums.txt
+sha256sum --check --ignore-missing checksums.txt
+gh attestation verify ./kvdrain_VERSION_OS_ARCH.tar.gz --repo stianfro/kvdrain
+```
+
+Extract the verified archive and place `kvdrain` on your `PATH`.
 
 Build from source with Go 1.25.12 or newer:
 
@@ -93,12 +105,14 @@ Drain flags mirror the safety choices that matter for this client:
 1. Check API permissions and take a source-node snapshot.
 2. Refuse hard blockers before cordoning. Examples include non-migratable VMIs, an unsafe eviction strategy, no eligible target, unmanaged pods, and `emptyDir` without explicit consent.
 3. Send dry-run launcher evictions and require KubeVirt's migration response.
-4. Cordon with server-side apply, then repeat the safety checks.
+4. Acquire a per-node Lease, cordon with run-specific ownership, then repeat the safety checks.
 5. Evict normal pods, then launchers, subject to the outbound migration limit.
-6. Follow VMIM history from the run cutoff. KubeVirt owns replacement VMIM creation. kvdrain observes immutable failed attempts and stops when the retry budget is exceeded.
-7. Finish only after source VMIs, active VMIMs, and eligible source pods are gone, and hotplug volumes are ready on their target nodes.
+6. Baseline every existing VMIM UID. Count only newly observed migration UIDs against the retry budget.
+7. Finish only after three empty observations, a final relist, and hotplug verification for every VMI UID observed during the run.
 
 On the first interrupt, kvdrain stops new evictions and waits for active migrations to settle. A second interrupt exits immediately. `--abort-uncordons` restores a node only when this run cordoned it, no source VMI remains, and the interrupted work has settled.
+
+Kubernetes cordons do not block workloads that set `spec.nodeName` directly. kvdrain uses a quiet interval and a final relist to detect late arrivals, but operators must prevent direct node assignment during maintenance.
 
 ## Exit codes
 

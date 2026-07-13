@@ -17,8 +17,9 @@ Drain also needs:
 - `patch` on nodes
 - `create` on `pods/eviction`
 - `list` on events for timeout diagnostics
+- `get,create,delete` on `coordination.k8s.io/leases` in `kube-system` for the per-node drain lock
 
-Optional transfer metrics need `get` on `pods/proxy`. Missing metrics access does not fail a drain.
+Optional transfer metrics need `get` on pods and `pods/proxy`, plus `get` on `apps/daemonsets`, in the KubeVirt installation namespace. Missing metrics access does not fail a drain.
 
 Uncordon needs `patch` on nodes. The API server must allow `authorization.k8s.io/selfsubjectaccessreviews` so the preflight can run.
 
