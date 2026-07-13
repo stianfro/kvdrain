@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Usage question
+    url: https://github.com/stianfro/kvdrain/discussions
+    about: Ask for help with installation or operation
+  - name: Security report
+    url: https://github.com/stianfro/kvdrain/security/advisories/new
+    about: Report a suspected vulnerability privately

@@ -1,0 +1,5 @@
+/.cache/
+/dist/
+/kvdrain
+*.test
+coverage.out
