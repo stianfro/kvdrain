@@ -127,6 +127,10 @@ kvdrain watch --json | jq -c 'select(.type == "migration")'
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 
+## AI development notice
+
+The initial implementation and project scaffolding were created by OpenAI GPT-5.6 Codex under human direction. The maintainer reviewed the design, safety decisions, tests, documentation, and resulting code. AI involvement does not replace normal security review, testing, or operator responsibility when using this tool on a cluster.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
