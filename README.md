@@ -26,28 +26,32 @@ Transfer metrics are optional. kvdrain attempts to read the source node's `virt-
 
 ## Install
 
-Download an archive, `checksums.txt`, and `checksums.txt.sigstore.json` from [GitHub Releases](https://github.com/stianfro/kvdrain/releases). Verify the GitHub Actions signing identity before trusting the checksums:
+Homebrew on macOS or Linux, after the `v0.1.0` tap is published:
 
 ```sh
-cosign verify-blob \
-  --bundle checksums.txt.sigstore.json \
-  --certificate-identity-regexp '^https://github\.com/stianfro/kvdrain/\.github/workflows/release\.yml@refs/tags/v[0-9].*$' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  checksums.txt
-sha256sum --check --ignore-missing checksums.txt
-gh attestation verify ./kvdrain_VERSION_OS_ARCH.tar.gz --repo stianfro/kvdrain
+brew install stianfro/tap/kvdrain
 ```
 
-Extract the verified archive and place `kvdrain` on your `PATH`.
-
-Build from source with Go 1.25.12 or newer:
+POSIX installer on Linux or macOS:
 
 ```sh
-git clone https://github.com/stianfro/kvdrain.git
-cd kvdrain
-just build
-install .cache/bin/kvdrain ~/.local/bin/kvdrain
+curl -fsSL https://github.com/stianfro/kvdrain/releases/latest/download/install.sh | sh
 ```
+
+The installer selects the latest regular release, verifies the exact archive entry
+in `checksums.txt`, confirms the binary version, and installs without `sudo` or
+profile changes. Pin a release with `KVDRAIN_VERSION=vX.Y.Z`. Review the script
+before piping it to a shell.
+
+Krew installs the CLI as a kubectl plugin after its index entry is published:
+
+```sh
+kubectl krew install kvdrain
+kubectl kvdrain status worker-3
+```
+
+Windows and manual verification instructions are in [docs/install.md](docs/install.md).
+Source builds are documented in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Usage
 
