@@ -12,6 +12,15 @@ just test
 just ci
 ```
 
+Build from source with:
+
+```sh
+git clone https://github.com/stianfro/kvdrain.git
+cd kvdrain
+just build
+install .cache/bin/kvdrain "$HOME/.local/bin/kvdrain"
+```
+
 Use conventional commit messages such as `fix: retry a failed migration trigger`. Add tests for changed behavior. Do not use a production cluster for development drains.
 
 The guarded lab harness is documented in [docs/lab-e2e.md](docs/lab-e2e.md).

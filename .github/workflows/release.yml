@@ -52,3 +52,29 @@ jobs:
       - uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         with:
           subject-checksums: dist/checksums.txt
+
+  krew:
+    if: github.repository == 'stianfro/kvdrain' && vars.KREW_PUBLISH == 'true'
+    needs:
+      - release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - id: stable
+        name: Check for a stable semantic version tag
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.stable.outputs.publish == 'true'
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+        with:
+          just-version: 1.56.0
+      - if: steps.stable.outputs.publish == 'true'
+        name: Publish Krew manifest proposal
+        run: just krew-publish
